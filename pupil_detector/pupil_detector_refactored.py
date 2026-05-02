@@ -1,10 +1,15 @@
 import argparse
 import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple, Any, List
 
 import cv2
 import numpy as np
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 
 # =========================
@@ -344,6 +349,14 @@ class DetectorConfig:
     edge_fill: int = 255
     show_mask_box: bool = False
 
+    # HeatmapNet-based ROI
+    heatmap_ckpt: str = ""        # path to .pth; empty = disabled (falls back to full-frame ROI)
+    heatmap_roi_size: int = 140   # side length of the square ROI in pixels
+    heatmap_device: str = "cpu"
+    heatmap_input_size: int = 256
+    heatmap_kp_index: int = 1     # 1 = pupil channel
+    heatmap_sigma: float = 1.2
+
 
 @dataclass
 class FrameContext:
@@ -370,6 +383,33 @@ class PupilDetector:
         self.cfg = cfg
         self.steps: Dict[int, Callable[[np.ndarray, PreprocessResult, FrameContext], np.ndarray]] = self._build_steps()
 
+        self._heatmap_model = None
+        if cfg.heatmap_ckpt:
+            from utils.heatmap_infer import load_heatmapnet
+            self._heatmap_model = load_heatmapnet(cfg.heatmap_ckpt, cfg.heatmap_device)
+            print(f"[PupilDetector] HeatmapNet loaded from {cfg.heatmap_ckpt} "
+                  f"(device={cfg.heatmap_device}, roi={cfg.heatmap_roi_size}px)")
+
+    def _heatmap_roi(self, gray: np.ndarray) -> Tuple[int, int, int, int]:
+        """Run HeatmapNet on the full eye frame and return an N×N ROI centered on the prediction."""
+        from utils.heatmap_infer import infer_pupil_from_heatmapnet
+        pred = infer_pupil_from_heatmapnet(
+            self._heatmap_model, gray,
+            self.cfg.heatmap_device,
+            self.cfg.heatmap_input_size,
+            self.cfg.heatmap_kp_index,
+            self.cfg.heatmap_sigma,
+        )
+        h, w = gray.shape[:2]
+        cx = int(round(pred.x))
+        cy = int(round(pred.y))
+        hs = self.cfg.heatmap_roi_size // 2
+        x0 = max(0, cx - hs)
+        y0 = max(0, cy - hs)
+        x1 = min(w, cx + hs)
+        y1 = min(h, cy + hs)
+        return (x0, y0, x1, y1)
+
     def preprocess(self, frame: np.ndarray, ctx: FrameContext) -> PreprocessResult:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -394,6 +434,10 @@ class PupilDetector:
                 rel_offset=self.cfg.edge_rel_offset
             )
             masked_frame, mask_bbox = apply_edge_mask(masked_frame, edge_side, width_px, fill_value=self.cfg.edge_fill)
+
+        if self._heatmap_model is not None:
+            gray_full = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
+            ctx.roi_rect = self._heatmap_roi(gray_full)
 
         return PreprocessResult(
             masked_frame=masked_frame,
@@ -830,6 +874,12 @@ def build_arg_parser():
     ap.add_argument("--support_dist_px", type=float, default=2.0)
     ap.add_argument("--support_min_frac", type=float, default=0.20)
 
+    ap.add_argument("--heatmap_ckpt", type=str, default="",
+                    help="HeatmapNet checkpoint (.pth). If set, uses heatmap to place ROI each frame.")
+    ap.add_argument("--heatmap_roi_size", type=int, default=140,
+                    help="Side length (px) of the square ROI centered on heatmap prediction")
+    ap.add_argument("--heatmap_device", type=str, default="cpu")
+
     ap.add_argument("--edge_mask", type=str, default="auto", choices=["auto", "left", "right", "off"])
     ap.add_argument("--edge_max_frac", type=float, default=0.45)
     ap.add_argument("--edge_thr_mode", type=str, default="otsu", choices=["otsu", "relative"])
@@ -864,6 +914,10 @@ def cfg_from_args(args) -> DetectorConfig:
 
         support_dist_px=args.support_dist_px,
         support_min_frac=args.support_min_frac,
+
+        heatmap_ckpt=args.heatmap_ckpt,
+        heatmap_roi_size=args.heatmap_roi_size,
+        heatmap_device=args.heatmap_device,
 
         edge_mask=args.edge_mask,
         edge_max_frac=args.edge_max_frac,
