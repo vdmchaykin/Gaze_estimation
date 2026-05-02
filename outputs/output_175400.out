@@ -1,0 +1,5 @@
+/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/io/image.py:13: UserWarning: Failed to load image Python extension: '/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/image.so: undefined symbol: _ZN3c1017RegisterOperatorsD1Ev'If you don't plan on using image functionality from `torchvision.io`, you can ignore this warning. Otherwise, there might be something wrong with your environment. Did you have `libjpeg` or `libpng` installed before building `torchvision` from source?
+  warn(
+Left: PupilPrediction(x=78.82539682539682, y=109.14285714285714, conf=0.6018327474594116)
+Right: PupilPrediction(x=78.82539682539682, y=121.26984126984127, conf=0.5913776159286499)
+Saved outputs/debug_pupil_frame0.png

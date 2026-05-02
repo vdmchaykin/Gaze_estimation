@@ -1,0 +1,54 @@
+/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/io/image.py:13: UserWarning: Failed to load image Python extension: '/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/image.so: undefined symbol: _ZN3c1017RegisterOperatorsD1Ev'If you don't plan on using image functionality from `torchvision.io`, you can ignore this warning. Otherwise, there might be something wrong with your environment. Did you have `libjpeg` or `libpng` installed before building `torchvision` from source?
+  warn(
+Found sessions: 4
+Train sessions: ['2024-11-20_15-16-53-ef3474a6', '2024-11-20_15-26-34-f18e4f45', '2024-11-20_15-32-05-32205695']
+Val session: 2024-11-20_15-20-28-4ff00407
+Eye frame: 384x192 => per-eye: 192x192, fps=198.7599856810765, frames=23795
+[2024-11-20_15-16-53-ef3474a6] processed 200/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 400/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 600/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 800/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 1000/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 1200/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 1400/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 1600/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 1800/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 2000/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 2200/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] processed 2400/2592 selected frames
+[2024-11-20_15-16-53-ef3474a6] samples: 2578 (from pupil frames 2592)
+[2024-11-20_15-26-34-f18e4f45] processed 200/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 400/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 600/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 800/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 1000/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 1200/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 1400/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 1600/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] processed 1800/1962 selected frames
+[2024-11-20_15-26-34-f18e4f45] samples: 1934 (from pupil frames 1962)
+[2024-11-20_15-32-05-32205695] processed 200/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 400/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 600/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 800/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 1000/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 1200/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 1400/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 1600/1809 selected frames
+[2024-11-20_15-32-05-32205695] processed 1800/1809 selected frames
+[2024-11-20_15-32-05-32205695] samples: 1809 (from pupil frames 1809)
+Train samples total: 6321
+[2024-11-20_15-20-28-4ff00407] processed 200/1492 selected frames
+[2024-11-20_15-20-28-4ff00407] processed 400/1492 selected frames
+[2024-11-20_15-20-28-4ff00407] processed 600/1492 selected frames
+[2024-11-20_15-20-28-4ff00407] processed 800/1492 selected frames
+[2024-11-20_15-20-28-4ff00407] processed 1000/1492 selected frames
+[2024-11-20_15-20-28-4ff00407] processed 1200/1492 selected frames
+[2024-11-20_15-20-28-4ff00407] processed 1400/1492 selected frames
+[2024-11-20_15-20-28-4ff00407] samples: 1482 (from pupil frames 1492)
+Val samples total: 1482
+VAL metrics: {'n': 1482, 'mean_px': 102.46670532226562, 'median_px': 96.00953674316406, 'p90_px': 157.23382568359375, 'p95_px': 173.1722869873047, 'max_px': 268.81549072265625}
+Saved model: outputs/eye_to_gaze/gaze_mapping_model.npz
+Saved val predictions: outputs/eye_to_gaze/val_predictions.csv
+Saved metrics: outputs/eye_to_gaze/metrics_val.json
+Saved visualizations in: outputs/eye_to_gaze/vis_eye

@@ -1,0 +1,2 @@
+paper_w=1000
+paper_h=700

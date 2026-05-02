@@ -1,0 +1,32 @@
+>>> pretrain_unityeyes.py started
+>>> Project root added to sys.path: /home/s44vchai/Computer_Animation/Project
+/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/io/image.py:13: UserWarning: Failed to load image Python extension: '/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/image.so: undefined symbol: _ZN3c1017RegisterOperatorsD1Ev'If you don't plan on using image functionality from `torchvision.io`, you can ignore this warning. Otherwise, there might be something wrong with your environment. Did you have `libjpeg` or `libpng` installed before building `torchvision` from source?
+  warn(
+>>> Initializing UnityEyes dataset
+[Dataset] Scanning directory: data/UnityEyes/imgs
+[Dataset] Total samples: 50064
+>>> Dataset initialized
+>>> Creating DataLoader
+Dataset size: 50064 samples
+Using device: cuda
+Batch size: 16
+--------------------------------------------------
+[Epoch 1/20] [Batch 0/3129] loss=0.203963 avg_epoch_loss=0.203963 time=0.0min
+[Epoch 1/20] [Batch 50/3129] loss=0.000597 avg_epoch_loss=0.019498 time=0.1min
+[Epoch 1/20] [Batch 100/3129] loss=0.000495 avg_epoch_loss=0.010063 time=0.1min
+[Epoch 1/20] [Batch 150/3129] loss=0.000179 avg_epoch_loss=0.006831 time=0.1min
+[Epoch 1/20] [Batch 200/3129] loss=0.000166 avg_epoch_loss=0.005183 time=0.1min
+[Epoch 1/20] [Batch 250/3129] loss=0.000150 avg_epoch_loss=0.004186 time=0.2min
+[Epoch 1/20] [Batch 300/3129] loss=0.000113 avg_epoch_loss=0.003520 time=0.2min
+[Epoch 1/20] [Batch 350/3129] loss=0.000156 avg_epoch_loss=0.003036 time=0.2min
+[Epoch 1/20] [Batch 400/3129] loss=0.000084 avg_epoch_loss=0.002673 time=0.2min
+[Epoch 1/20] [Batch 450/3129] loss=0.000131 avg_epoch_loss=0.002389 time=0.3min
+[Epoch 1/20] [Batch 500/3129] loss=0.000051 avg_epoch_loss=0.002160 time=0.3min
+[Epoch 1/20] [Batch 550/3129] loss=0.000064 avg_epoch_loss=0.001973 time=0.3min
+[Epoch 1/20] [Batch 600/3129] loss=0.000057 avg_epoch_loss=0.001815 time=0.3min
+[Epoch 1/20] [Batch 650/3129] loss=0.000047 avg_epoch_loss=0.001679 time=0.4min
+[Epoch 1/20] [Batch 700/3129] loss=0.000046 avg_epoch_loss=0.001565 time=0.4min
+[Epoch 1/20] [Batch 750/3129] loss=0.000035 avg_epoch_loss=0.001465 time=0.4min
+[Epoch 1/20] [Batch 800/3129] loss=0.000082 avg_epoch_loss=0.001378 time=0.5min
+[Epoch 1/20] [Batch 850/3129] loss=0.000053 avg_epoch_loss=0.001300 time=0.5min
+slurmstepd: error: *** JOB 171293 ON node-02 CANCELLED AT 2026-01-01T20:32:52 ***
