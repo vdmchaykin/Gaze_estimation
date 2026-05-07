@@ -31,12 +31,14 @@ def load_heatmapnet(checkpoint_path: str, device: str) -> torch.nn.Module:
       - raw state_dict
       - dict with 'state_dict'
     """
-    model = HeatmapNet()
-
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     state = ckpt.get("state_dict", ckpt)
 
     state = _strip_module_prefix(state)
+
+    # Auto-detect num_keypoints from checkpoint to handle old (1-channel) ckpts
+    num_keypoints = state["head.weight"].shape[0] if "head.weight" in state else 2
+    model = HeatmapNet(num_keypoints=num_keypoints)
 
     # strict=False to survive small mismatches (e.g., missing keys)
     missing, unexpected = model.load_state_dict(state, strict=False)

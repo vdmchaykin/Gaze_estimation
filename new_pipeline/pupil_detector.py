@@ -150,6 +150,53 @@ def compute_specular_mask(roi_gray, thr=220, dilate=3):
     return spec
 
 
+def compute_eyelash_mask(roi_gray, dark_thr=70, kernel_len=13, n_angles=6, dilate=2):
+    """Detect thin elongated dark structures (eyelashes) via morphological line opening."""
+    dark = (roi_gray < dark_thr).astype(np.uint8) * 255
+    eyelash = np.zeros_like(dark)
+    half = kernel_len // 2
+    angle_step = 180 // n_angles
+    for a_deg in range(0, 180, angle_step):
+        rad = np.deg2rad(a_deg)
+        cos_a, sin_a = np.cos(rad), np.sin(rad)
+        kernel = np.zeros((kernel_len, kernel_len), np.uint8)
+        for i in range(-half, half + 1):
+            x = int(round(half + i * cos_a))
+            y = int(round(half + i * sin_a))
+            if 0 <= x < kernel_len and 0 <= y < kernel_len:
+                kernel[y, x] = 1
+        if int(kernel.sum()) < 3:
+            continue
+        opened = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
+        eyelash = cv2.bitwise_or(eyelash, opened)
+    if dilate > 0:
+        dk = 2 * dilate + 1
+        eyelash = cv2.dilate(eyelash, np.ones((dk, dk), np.uint8))
+    return eyelash
+
+
+def fit_ellipse_ransac(points, n_iter=100, inlier_dist=2.5):
+    """Fit ellipse using RANSAC — robust to eyelash edge outliers."""
+    pts = points.reshape(-1, 2).astype(np.float32)
+    n = len(pts)
+    if n < 5:
+        return None
+    best_ell, best_inliers = None, 0
+    for _ in range(n_iter):
+        idx = np.random.choice(n, 5, replace=False)
+        sample = pts[idx].reshape(-1, 1, 2)
+        try:
+            ell = cv2.fitEllipse(sample)
+        except cv2.error:
+            continue
+        frac, _ = ellipse_support_score(ell, pts, dist_px=inlier_dist)
+        n_inliers = int(frac * n)
+        if n_inliers > best_inliers:
+            best_inliers = n_inliers
+            best_ell = ell
+    return best_ell
+
+
 def _angle_deg(v1, v2):
     n1 = np.linalg.norm(v1) + 1e-9
     n2 = np.linalg.norm(v2) + 1e-9
@@ -280,6 +327,29 @@ class DetectorConfig:
     heatmap_input_size: int = 256
     heatmap_kp_index: int = 1     # 1 = pupil channel
     heatmap_sigma: float = 1.2
+    heatmap_prior_weight: float = 0.3  # penalty weight for distance from heatmap prediction
+
+    # Eyelash masking
+    eyelash_dark_thr: int = 70    # intensity threshold for eyelash detection
+    eyelash_kernel_len: int = 13  # line kernel length in pixels
+    eyelash_n_angles: int = 6     # number of line orientations (0..180°)
+    eyelash_dilate: int = 2       # dilation radius for eyelash mask (px)
+
+    # Edge gap closing (bridges pupil arc breaks caused by eyelashes)
+    morph_close_size: int = 2     # closing kernel radius; 0 = disabled (kernel = 2r+1)
+
+    # RANSAC ellipse fitting
+    ransac_n_iter: int = 100      # 0 = use direct fitEllipse (original behaviour)
+
+    # Segment linearity filter (eyelash rejection)
+    # chord/arc_length ratio: 1.0 = perfectly straight, ~0.5 = strong curve
+    # Segments above this threshold are rejected as eyelashes
+    max_seg_straightness: float = 0.92
+
+    # Preview eye selection: "both", "left", "right"
+    preview_eye: str = "both"
+    # Scale factor applied to the preview window (bilinear upscale, does not affect saved video)
+    preview_scale: float = 2.0
 
 
 
@@ -292,6 +362,9 @@ class FrameContext:
     pupil_cy: float = float("nan")
     pupil_diameter: float = float("nan")
     pupil_confidence: float = float("nan")
+    # heatmap prediction in full-frame coords; NaN if heatmap disabled
+    heatmap_cx: float = float("nan")
+    heatmap_cy: float = float("nan")
 
 
 @dataclass
@@ -315,7 +388,7 @@ class PupilDetector:
             print(f"[PupilDetector] HeatmapNet loaded from {cfg.heatmap_ckpt} "
                   f"(device={cfg.heatmap_device}, roi={cfg.heatmap_roi_size}px)")
 
-    def _heatmap_roi(self, gray: np.ndarray) -> Tuple[int, int, int, int]:
+    def _heatmap_roi(self, gray: np.ndarray, ctx: FrameContext) -> Tuple[int, int, int, int]:
         """Run HeatmapNet on the full eye frame and return an N×N ROI centered on the prediction."""
         from utils.heatmap_infer import infer_pupil_from_heatmapnet
         pred = infer_pupil_from_heatmapnet(
@@ -328,6 +401,8 @@ class PupilDetector:
         h, w = gray.shape[:2]
         cx = int(round(pred.x))
         cy = int(round(pred.y))
+        ctx.heatmap_cx = float(cx)
+        ctx.heatmap_cy = float(cy)
         hs = self.cfg.heatmap_roi_size // 2
         x0 = max(0, cx - hs)
         y0 = max(0, cy - hs)
@@ -338,7 +413,7 @@ class PupilDetector:
     def preprocess(self, frame: np.ndarray, ctx: FrameContext) -> PreprocessResult:
         if self._heatmap_model is not None:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            ctx.roi_rect = self._heatmap_roi(gray)
+            ctx.roi_rect = self._heatmap_roi(gray, ctx)
 
         return PreprocessResult(masked_frame=frame)
 
@@ -348,6 +423,7 @@ class PupilDetector:
 
     def _build_steps(self):
         return {
+            0: self._step_all,
             1: self._step1_roi_guess,
             2: self._step2_canny,
             3: self._step3_dark_mask_overlay,
@@ -418,9 +494,18 @@ class PupilDetector:
 
         dark_mask, peak, thr = compute_dark_region_mask(roi, offset=18)
         spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
+        eyelash_mask = compute_eyelash_mask(
+            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
+            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
 
         edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_final = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
+
+        if self.cfg.morph_close_size > 0:
+            k = 2 * self.cfg.morph_close_size + 1
+            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
+                                           np.ones((k, k), np.uint8))
 
         out = prep.masked_frame.copy()
         cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
@@ -432,7 +517,13 @@ class PupilDetector:
         red[y0:y1, x0:x1, 2] = spec_mask
         out = cv2.addWeighted(out, 1.0, red, 0.35, 0)
 
-        cv2.putText(out, f"edges ∩ dark ∩ !spec (peak={peak}, thr={thr}, spec={self.cfg.spec_thr})",
+        # Cyan overlay: eyelash-masked region
+        cyan = np.zeros_like(out)
+        cyan[y0:y1, x0:x1, 0] = eyelash_mask
+        cyan[y0:y1, x0:x1, 1] = eyelash_mask
+        out = cv2.addWeighted(out, 1.0, cyan, 0.25, 0)
+
+        cv2.putText(out, f"edges ∩ dark ∩ !spec ∩ !lash (peak={peak}, thr={thr}, spec={self.cfg.spec_thr})",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 255), 2, cv2.LINE_AA)
         return out
@@ -447,9 +538,18 @@ class PupilDetector:
 
         dark_mask, peak, thr = compute_dark_region_mask(roi, offset=18)
         spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
+        eyelash_mask = compute_eyelash_mask(
+            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
+            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
 
         edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_final = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
+
+        if self.cfg.morph_close_size > 0:
+            k = 2 * self.cfg.morph_close_size + 1
+            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
+                                           np.ones((k, k), np.uint8))
 
         contours, _ = cv2.findContours(edges_final, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
 
@@ -474,6 +574,10 @@ class PupilDetector:
                 max_corner_deg=self.cfg.split_corner_deg
             )
             for seg in segments:
+                chord = float(np.linalg.norm(seg[-1] - seg[0]))
+                arc = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) + 1e-9
+                if chord / arc > self.cfg.max_seg_straightness:
+                    continue  # reject eyelash-like straight segments
                 c = palette[seg_count % len(palette)]
                 seg_shift = seg.copy()
                 seg_shift[:, 0] += x0
@@ -496,8 +600,18 @@ class PupilDetector:
 
         dark_mask, _, _ = compute_dark_region_mask(roi, offset=18)
         spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
+        eyelash_mask = compute_eyelash_mask(
+            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
+            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
+
         edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_final = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
+
+        if self.cfg.morph_close_size > 0:
+            k = 2 * self.cfg.morph_close_size + 1
+            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
+                                           np.ones((k, k), np.uint8))
 
         contours, _ = cv2.findContours(edges_final, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
 
@@ -519,6 +633,10 @@ class PupilDetector:
             for seg in segments:
                 if len(seg) < 5:
                     continue
+                chord = float(np.linalg.norm(seg[-1] - seg[0]))
+                arc = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) + 1e-9
+                if chord / arc > self.cfg.max_seg_straightness:
+                    continue  # reject eyelash-like straight segments
                 seg_cv = seg.reshape(-1, 1, 2).astype(np.float32)
                 try:
                     ell = cv2.fitEllipse(seg_cv)
@@ -571,9 +689,18 @@ class PupilDetector:
 
         dark_mask, peak, thr = compute_dark_region_mask(roi, offset=18)
         spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
+        eyelash_mask = compute_eyelash_mask(
+            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
+            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
 
         edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_final = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
+        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
+
+        if self.cfg.morph_close_size > 0:
+            k = 2 * self.cfg.morph_close_size + 1
+            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
+                                           np.ones((k, k), np.uint8))
 
         ys, xs = np.where(edges_final > 0)
         edge_pts = np.stack([xs, ys], axis=1).astype(np.float32) if len(xs) else np.zeros((0, 2), np.float32)
@@ -583,6 +710,10 @@ class PupilDetector:
         roi_h, roi_w = roi.shape
         roi_cx, roi_cy = roi_w / 2.0, roi_h / 2.0
         roi_rad = 0.5 * min(roi_w, roi_h)
+
+        # Heatmap prior: convert full-frame coords to ROI-local coords
+        hm_roi_cx = ctx.heatmap_cx - x0 if not np.isnan(ctx.heatmap_cx) else None
+        hm_roi_cy = ctx.heatmap_cy - y0 if not np.isnan(ctx.heatmap_cy) else None
 
         candidates = []
         for cnt in contours:
@@ -599,11 +730,21 @@ class PupilDetector:
             for seg in segments:
                 if len(seg) < 5:
                     continue
-                seg_cv = seg.reshape(-1, 1, 2).astype(np.float32)
-                try:
-                    ell = cv2.fitEllipse(seg_cv)
-                except cv2.error:
-                    continue
+                chord = float(np.linalg.norm(seg[-1] - seg[0]))
+                arc = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) + 1e-9
+                if chord / arc > self.cfg.max_seg_straightness:
+                    continue  # reject eyelash-like straight segments
+
+                if self.cfg.ransac_n_iter > 0:
+                    ell = fit_ellipse_ransac(seg, self.cfg.ransac_n_iter, self.cfg.support_dist_px)
+                    if ell is None:
+                        continue
+                else:
+                    seg_cv = seg.reshape(-1, 1, 2).astype(np.float32)
+                    try:
+                        ell = cv2.fitEllipse(seg_cv)
+                    except cv2.error:
+                        continue
 
                 area = ellipse_area(ell)
                 if area < self.cfg.min_ellipse_area:
@@ -619,7 +760,13 @@ class PupilDetector:
                     continue
 
                 support_frac, support_score = ellipse_support_score(ell, edge_pts, dist_px=self.cfg.support_dist_px)
-                final_score = support_score - 0.25 * dist - 0.05 * max(0.0, asp - 1.0)
+
+                heatmap_penalty = 0.0
+                if hm_roi_cx is not None:
+                    hm_dist = np.sqrt((ecx - hm_roi_cx)**2 + (ecy - hm_roi_cy)**2) / (roi_rad + 1e-9)
+                    heatmap_penalty = self.cfg.heatmap_prior_weight * hm_dist
+
+                final_score = support_score - 0.25 * dist - 0.05 * max(0.0, asp - 1.0) - heatmap_penalty
                 candidates.append((final_score, support_frac, dist, asp, ell))
 
         out = prep.masked_frame.copy()
@@ -657,6 +804,35 @@ class PupilDetector:
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                     (255, 255, 255), 2, cv2.LINE_AA)
         return out
+
+    def _step_all(self, frame, prep, ctx):
+        """Render all 8 pipeline steps as a 4×2 mosaic (same output size as a single step)."""
+        ordered = [
+            (1, self._step1_roi_guess),
+            (2, self._step2_canny),
+            (3, self._step3_dark_mask_overlay),
+            (4, self._step4_edges_in_dark),
+            (5, self._step5_edges_dark_not_spec),
+            (6, self._step6_segments),
+            (7, self._step7_ellipse_candidates),
+            (8, self._step8_best_ellipse_by_support),
+        ]
+
+        h, w = frame.shape[:2]
+        panel_w = w // 4
+        panel_h = h // 2
+
+        panels = []
+        for step_num, fn in ordered:
+            panel = fn(frame, prep, ctx)
+            panel = cv2.resize(panel, (panel_w, panel_h))
+            cv2.putText(panel, f"S{step_num}", (3, 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+            panels.append(panel)
+
+        row1 = np.concatenate(panels[:4], axis=1)
+        row2 = np.concatenate(panels[4:], axis=1)
+        return np.concatenate([row1, row2], axis=0)  # full-res: 4*w × 2*h
 
     def _step_not_implemented(self, frame, prep, ctx):
         out = prep.masked_frame.copy()
@@ -749,7 +925,13 @@ def run_video(cfg: DetectorConfig):
             out_l  = detector.render(left,  prep_l, ctx_l)
             out_r  = detector.render(right, prep_r, ctx_r)
 
-            out = np.concatenate([out_l, out_r], axis=1)
+            if cfg.step == 0:
+                # mosaic frames are 4*mid × 2*h — downscale to writer dims before saving
+                write_l = cv2.resize(out_l, (mid, h), interpolation=cv2.INTER_AREA)
+                write_r = cv2.resize(out_r, (mid, h), interpolation=cv2.INTER_AREA)
+                out = np.concatenate([write_l, write_r], axis=1)
+            else:
+                out = np.concatenate([out_l, out_r], axis=1)
             writer.write(out)
 
             ts = timestamps[frame_idx] if timestamps else frame_idx
@@ -762,7 +944,22 @@ def run_video(cfg: DetectorConfig):
             ])
 
             if cfg.preview:
-                cv2.imshow("preview", out)
+                eye = cfg.preview_eye.lower()
+                if eye == "left":
+                    preview_frame = out_l
+                elif eye == "right":
+                    preview_frame = out_r
+                else:
+                    # for step=0: out is already downscaled for the writer — use full-res mosaics
+                    preview_frame = np.concatenate([out_l, out_r], axis=1) if cfg.step == 0 else out
+                if cfg.preview_scale != 1.0:
+                    ph, pw = preview_frame.shape[:2]
+                    preview_frame = cv2.resize(
+                        preview_frame,
+                        (int(pw * cfg.preview_scale), int(ph * cfg.preview_scale)),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                cv2.imshow("preview", preview_frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
@@ -788,7 +985,8 @@ def run_video(cfg: DetectorConfig):
 def build_arg_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
-    ap.add_argument("--step", type=int, default=0)
+    ap.add_argument("--step", type=int, default=0,
+                    help="Pipeline step to visualize (1-8). 0 = all steps as 4×2 mosaic.")
     ap.add_argument("--roi", type=str, default="")
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--out", type=str, default="")
@@ -818,6 +1016,31 @@ def build_arg_parser():
     ap.add_argument("--heatmap_roi_size", type=int, default=140,
                     help="Side length (px) of the square ROI centered on heatmap prediction")
     ap.add_argument("--heatmap_device", type=str, default="cuda" if _cuda_available() else "cpu")
+    ap.add_argument("--heatmap_kp_index", type=int, default=1,
+                    help="Keypoint channel index in heatmap output (0 for single-channel checkpoints)")
+    ap.add_argument("--heatmap_prior_weight", type=float, default=0.3,
+                    help="Scoring penalty weight for distance from heatmap prediction (0=disabled)")
+
+    ap.add_argument("--eyelash_dark_thr", type=int, default=70,
+                    help="Intensity threshold for eyelash dark-region detection")
+    ap.add_argument("--eyelash_kernel_len", type=int, default=13,
+                    help="Line kernel length (px) for morphological eyelash detection")
+    ap.add_argument("--eyelash_n_angles", type=int, default=6,
+                    help="Number of line orientations for eyelash detection (covers 0..180°)")
+    ap.add_argument("--eyelash_dilate", type=int, default=2,
+                    help="Dilation radius (px) applied to eyelash mask after detection")
+
+    ap.add_argument("--morph_close_size", type=int, default=2,
+                    help="Closing kernel radius for bridging pupil arc gaps; 0=disabled")
+    ap.add_argument("--ransac_n_iter", type=int, default=100,
+                    help="RANSAC iterations for ellipse fitting; 0=use direct fitEllipse")
+    ap.add_argument("--max_seg_straightness", type=float, default=0.92,
+                    help="Segment chord/arc ratio above which it is rejected as eyelash (1.0=straight line)")
+    ap.add_argument("--preview_eye", type=str, default="both",
+                    choices=["both", "left", "right"],
+                    help="Which eye to show in the preview window (saved video always has both)")
+    ap.add_argument("--preview_scale", type=float, default=2.0,
+                    help="Upscale factor for preview window (bilinear); does not affect saved video")
 
     return ap
 
@@ -852,6 +1075,19 @@ def cfg_from_args(args) -> DetectorConfig:
         heatmap_ckpt=args.heatmap_ckpt,
         heatmap_roi_size=args.heatmap_roi_size,
         heatmap_device=args.heatmap_device,
+        heatmap_kp_index=args.heatmap_kp_index,
+        heatmap_prior_weight=args.heatmap_prior_weight,
+
+        eyelash_dark_thr=args.eyelash_dark_thr,
+        eyelash_kernel_len=args.eyelash_kernel_len,
+        eyelash_n_angles=args.eyelash_n_angles,
+        eyelash_dilate=args.eyelash_dilate,
+
+        morph_close_size=args.morph_close_size,
+        ransac_n_iter=args.ransac_n_iter,
+        max_seg_straightness=args.max_seg_straightness,
+        preview_eye=args.preview_eye,
+        preview_scale=args.preview_scale,
     )
 
 
