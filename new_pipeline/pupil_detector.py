@@ -368,18 +368,9 @@ class DetectorConfig:
     heatmap_sigma: float = 1.2
     heatmap_prior_weight: float = 0.3  # penalty weight for distance from heatmap prediction
 
-    # Eyelash masking
-    eyelash_dark_thr: int = 70    # intensity threshold for eyelash detection
-    eyelash_kernel_len: int = 13  # line kernel length in pixels
-    eyelash_n_angles: int = 6     # number of line orientations (0..180°)
-    eyelash_dilate: int = 2       # dilation radius for eyelash mask (px)
-
     # Edge gap closing — endpoint bridging
     gap_bridge_max_dist: int = 0        # max pixel gap to bridge; 0 = disabled
     gap_bridge_angle_deg: float = 45.0  # max angle between endpoint tangent and bridge direction
-
-    # Edge gap closing (bridges pupil arc breaks caused by eyelashes)
-    morph_close_size: int = 0     # closing kernel radius; 0 = disabled (kernel = 2r+1)
 
     # RANSAC ellipse fitting
     ransac_n_iter: int = 100      # 0 = use direct fitEllipse (original behaviour)
@@ -951,21 +942,10 @@ def build_arg_parser():
     ap.add_argument("--heatmap_prior_weight", type=float, default=0.3,
                     help="Scoring penalty weight for distance from heatmap prediction (0=disabled)")
 
-    ap.add_argument("--eyelash_dark_thr", type=int, default=70,
-                    help="Intensity threshold for eyelash dark-region detection")
-    ap.add_argument("--eyelash_kernel_len", type=int, default=13,
-                    help="Line kernel length (px) for morphological eyelash detection")
-    ap.add_argument("--eyelash_n_angles", type=int, default=6,
-                    help="Number of line orientations for eyelash detection (covers 0..180°)")
-    ap.add_argument("--eyelash_dilate", type=int, default=2,
-                    help="Dilation radius (px) applied to eyelash mask after detection")
-
     ap.add_argument("--gap_bridge_max_dist", type=int, default=0,
                     help="Max pixel gap between arc endpoints to bridge; 0 = disabled")
     ap.add_argument("--gap_bridge_angle_deg", type=float, default=45.0,
                     help="Max tangent-to-bridge angle for endpoint bridging")
-    ap.add_argument("--morph_close_size", type=int, default=0,
-                    help="Closing kernel radius for bridging pupil arc gaps; 0=disabled")
     ap.add_argument("--ransac_n_iter", type=int, default=0,
                     help="RANSAC iterations for ellipse fitting; 0=use direct fitEllipse")
     ap.add_argument("--max_seg_straightness", type=float, default=0.92,
@@ -1015,14 +995,8 @@ def cfg_from_args(args) -> DetectorConfig:
         heatmap_kp_index=args.heatmap_kp_index,
         heatmap_prior_weight=args.heatmap_prior_weight,
 
-        eyelash_dark_thr=args.eyelash_dark_thr,
-        eyelash_kernel_len=args.eyelash_kernel_len,
-        eyelash_n_angles=args.eyelash_n_angles,
-        eyelash_dilate=args.eyelash_dilate,
-
         gap_bridge_max_dist=args.gap_bridge_max_dist,
         gap_bridge_angle_deg=args.gap_bridge_angle_deg,
-        morph_close_size=args.morph_close_size,
         ransac_n_iter=args.ransac_n_iter,
         max_seg_straightness=args.max_seg_straightness,
         preview_eye=args.preview_eye,
