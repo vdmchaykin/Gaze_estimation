@@ -117,12 +117,12 @@ def make_writer(output_path, fps, frame_size):
     raise RuntimeError("Could not open VideoWriter (XVID/MJPG).")
 
 
-def draw_step2_canny(frame_bgr, roi_rect):
+def draw_step2_canny(frame_bgr, roi_rect, canny_low=30, canny_high=90):
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     x0, y0, x1, y1 = roi_rect
     roi = gray[y0:y1, x0:x1]
     roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
-    edges = cv2.Canny(roi_blur, 30, 90)
+    edges = cv2.Canny(roi_blur, canny_low, canny_high)
 
     out = frame_bgr.copy()
     cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
@@ -300,6 +300,9 @@ class DetectorConfig:
     preview: bool = False
     out: str = ""
 
+    canny_low: int = 30
+    canny_high: int = 90
+
     spec_thr: int = 220
     spec_dilate: int = 3
 
@@ -368,8 +371,25 @@ class FrameContext:
 
 
 @dataclass
-class PreprocessResult:
-    masked_frame: np.ndarray
+class PipelineState:
+    frame_bgr: np.ndarray
+    gray: Optional[np.ndarray] = None
+    roi_rect: Optional[Tuple[int, int, int, int]] = None
+    roi_gray: Optional[np.ndarray] = None
+    edges: Optional[np.ndarray] = None
+    dark_mask: Optional[np.ndarray] = None
+    dark_peak: int = 0
+    dark_thr: int = 0
+    edges_dark: Optional[np.ndarray] = None
+    spec_mask: Optional[np.ndarray] = None
+    edges_filtered: Optional[np.ndarray] = None
+    segments: List[np.ndarray] = field(default_factory=list)
+    candidates: List = field(default_factory=list)  # (area, dist, asp, ell, seg)
+    best_ell: Any = None
+    best_support: float = 0.0
+    best_score: float = 0.0
+    best_dist: float = 0.0
+    best_asp: float = 0.0
 
 
 # =========================
@@ -379,8 +399,6 @@ class PreprocessResult:
 class PupilDetector:
     def __init__(self, cfg: DetectorConfig):
         self.cfg = cfg
-        self.steps: Dict[int, Callable[[np.ndarray, PreprocessResult, FrameContext], np.ndarray]] = self._build_steps()
-
         self._heatmap_model = None
         if cfg.heatmap_ckpt:
             from utils.heatmap_infer import load_heatmapnet
@@ -388,8 +406,301 @@ class PupilDetector:
             print(f"[PupilDetector] HeatmapNet loaded from {cfg.heatmap_ckpt} "
                   f"(device={cfg.heatmap_device}, roi={cfg.heatmap_roi_size}px)")
 
+    # ------------------------------------------------------------------ #
+    # Compute steps — each builds on the previous PipelineState          #
+    # ------------------------------------------------------------------ #
+
+    def _compute1(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        state.gray = cv2.cvtColor(state.frame_bgr, cv2.COLOR_BGR2GRAY)
+        if self._heatmap_model is not None:
+            state.roi_rect = self._heatmap_roi(state.gray, ctx)
+        else:
+            state.roi_rect = ctx.roi_rect
+        ctx.roi_rect = state.roi_rect
+        x0, y0, x1, y1 = state.roi_rect
+        state.roi_gray = state.gray[y0:y1, x0:x1]
+        return state
+
+    def _compute2(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        roi_blur = cv2.GaussianBlur(state.roi_gray, (5, 5), 0)
+        state.edges = cv2.Canny(roi_blur, self.cfg.canny_low, self.cfg.canny_high)
+        return state
+
+    def _compute3(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        state.dark_mask, state.dark_peak, state.dark_thr = compute_dark_region_mask(
+            state.roi_gray, offset=18)
+        return state
+
+    def _compute4(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        dark_dilated = cv2.dilate(state.dark_mask, np.ones((3, 3), np.uint8), iterations=1)
+        state.edges_dark = cv2.bitwise_and(state.edges, dark_dilated)
+        return state
+
+    def _compute5(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        state.spec_mask = compute_specular_mask(
+            state.roi_gray, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
+        edges_filtered = cv2.bitwise_and(state.edges_dark, cv2.bitwise_not(state.spec_mask))
+        if self.cfg.morph_close_size > 0:
+            k = 2 * self.cfg.morph_close_size + 1
+            edges_filtered = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE,
+                                              np.ones((k, k), np.uint8))
+        state.edges_filtered = edges_filtered
+        return state
+
+    def _compute6(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        contours, _ = cv2.findContours(state.edges_filtered, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        segments = []
+        for cnt in contours:
+            if cnt is None or len(cnt) < 5:
+                continue
+            pts = cnt.reshape(-1, 2).astype(np.float32)
+            for seg in split_contour_by_curvature(
+                pts,
+                min_len=self.cfg.split_min_len,
+                max_jump=self.cfg.split_max_jump,
+                max_corner_deg=self.cfg.split_corner_deg,
+            ):
+                chord = float(np.linalg.norm(seg[-1] - seg[0]))
+                arc = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) + 1e-9
+                if chord / arc <= self.cfg.max_seg_straightness:
+                    segments.append(seg)
+        state.segments = segments
+        return state
+
+    def _compute7(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        roi_h, roi_w = state.roi_gray.shape
+        roi_cx, roi_cy = roi_w / 2.0, roi_h / 2.0
+        roi_rad = 0.5 * min(roi_w, roi_h)
+        candidates = []
+        for seg in state.segments:
+            if len(seg) < 5:
+                continue
+            seg_cv = seg.reshape(-1, 1, 2).astype(np.float32)
+            try:
+                ell = cv2.fitEllipse(seg_cv)
+            except cv2.error:
+                continue
+            if ellipse_area(ell) < self.cfg.min_ellipse_area:
+                continue
+            asp = ellipse_aspect_ratio(ell)
+            if asp > self.cfg.max_aspect:
+                continue
+            (ecx, ecy), _, _ = ell
+            dist = np.sqrt((ecx - roi_cx) ** 2 + (ecy - roi_cy) ** 2) / (roi_rad + 1e-9)
+            if dist > self.cfg.max_center_dist:
+                continue
+            candidates.append((ellipse_area(ell), dist, asp, ell, seg))
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        state.candidates = candidates
+        return state
+
+    def _compute8(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
+        ctx.pupil_cx = ctx.pupil_cy = ctx.pupil_diameter = ctx.pupil_confidence = float("nan")
+
+        ys, xs = np.where(state.edges_filtered > 0)
+        edge_pts = (np.stack([xs, ys], axis=1).astype(np.float32)
+                    if len(xs) else np.zeros((0, 2), np.float32))
+
+        roi_h, roi_w = state.roi_gray.shape
+        roi_cx, roi_cy = roi_w / 2.0, roi_h / 2.0
+        roi_rad = 0.5 * min(roi_w, roi_h)
+
+        x0, y0 = state.roi_rect[0], state.roi_rect[1]
+        hm_roi_cx = ctx.heatmap_cx - x0 if not np.isnan(ctx.heatmap_cx) else None
+        hm_roi_cy = ctx.heatmap_cy - y0 if not np.isnan(ctx.heatmap_cy) else None
+
+        scored = []
+        for (area, dist, asp, ell_init, seg) in state.candidates:
+            if self.cfg.ransac_n_iter > 0:
+                ell = fit_ellipse_ransac(seg, self.cfg.ransac_n_iter, self.cfg.support_dist_px)
+                if ell is None:
+                    continue
+                if ellipse_area(ell) < self.cfg.min_ellipse_area:
+                    continue
+                asp = ellipse_aspect_ratio(ell)
+                if asp > self.cfg.max_aspect:
+                    continue
+                (ecx, ecy), _, _ = ell
+                dist = np.sqrt((ecx - roi_cx) ** 2 + (ecy - roi_cy) ** 2) / (roi_rad + 1e-9)
+                if dist > self.cfg.max_center_dist:
+                    continue
+            else:
+                ell = ell_init
+                (ecx, ecy), _, _ = ell
+
+            support_frac, support_score = ellipse_support_score(
+                ell, edge_pts, dist_px=self.cfg.support_dist_px)
+
+            heatmap_penalty = 0.0
+            if hm_roi_cx is not None:
+                hm_dist = np.sqrt((ecx - hm_roi_cx) ** 2 + (ecy - hm_roi_cy) ** 2) / (roi_rad + 1e-9)
+                heatmap_penalty = self.cfg.heatmap_prior_weight * hm_dist
+
+            final_score = support_score - 0.25 * dist - 0.05 * max(0.0, asp - 1.0) - heatmap_penalty
+            scored.append((final_score, support_frac, dist, asp, ell))
+
+        if not scored:
+            return state
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        best_score, best_support, best_dist, best_asp, best_ell = scored[0]
+
+        if best_support < self.cfg.support_min_frac:
+            return state
+
+        state.best_ell = best_ell
+        state.best_support = best_support
+        state.best_score = best_score
+        state.best_dist = best_dist
+        state.best_asp = best_asp
+
+        (cx, cy), (A, B), _ = best_ell
+        ctx.pupil_cx = cx + x0
+        ctx.pupil_cy = cy + y0
+        ctx.pupil_diameter = (A + B) / 2.0
+        ctx.pupil_confidence = best_support
+        return state
+
+    # ------------------------------------------------------------------ #
+    # Visualization — one method per step                                 #
+    # ------------------------------------------------------------------ #
+
+    def _viz1(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+
+        return out
+
+    def _viz2(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+        ys, xs = np.where(state.edges > 0)
+        out[y0 + ys, x0 + xs] = (0, 255, 0)
+
+        return out
+
+    def _viz3(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        overlay = np.zeros_like(out)
+        overlay[y0:y1, x0:x1, 0] = state.dark_mask
+        out = cv2.addWeighted(out, 1.0, overlay, 0.6, 0)
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+
+        return out
+
+    def _viz4(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+        ys, xs = np.where(state.edges_dark > 0)
+        out[y0 + ys, x0 + xs] = (0, 255, 0)
+
+        return out
+
+    def _viz5(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+        ys, xs = np.where(state.edges_filtered > 0)
+        out[y0 + ys, x0 + xs] = (0, 255, 0)
+        red = np.zeros_like(out)
+        red[y0:y1, x0:x1, 2] = state.spec_mask
+        out = cv2.addWeighted(out, 1.0, red, 0.35, 0)
+
+        return out
+
+    def _viz6(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+        palette = [(0, 255, 0), (0, 200, 255), (255, 200, 0),
+                   (255, 0, 255), (255, 255, 0), (0, 255, 255), (200, 200, 255)]
+        for i, seg in enumerate(state.segments):
+            seg_shift = seg.copy()
+            seg_shift[:, 0] += x0
+            seg_shift[:, 1] += y0
+            draw_polyline(out, seg_shift, palette[i % len(palette)], thickness=2)
+
+        return out
+
+    def _viz7(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+        ys, xs = np.where(state.edges_filtered > 0)
+        out[y0 + ys, x0 + xs] = (0, 255, 0)
+        to_draw = state.candidates if self.cfg.draw_all_ellipses else state.candidates[:self.cfg.topN]
+        for (area, dist, asp, ell, _seg) in to_draw:
+            (ecx, ecy), (A, B), ang = ell
+            cv2.ellipse(out, ((ecx + x0, ecy + y0), (A, B), ang), (255, 0, 0), 2)
+
+        return out
+
+    def _viz8(self, state: PipelineState) -> np.ndarray:
+        out = state.frame_bgr.copy()
+        x0, y0, x1, y1 = state.roi_rect
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+        ys, xs = np.where(state.edges_filtered > 0)
+        out[y0 + ys, x0 + xs] = (0, 255, 0)
+        if state.best_ell is None:
+            label = "no candidates" if not state.candidates else f"support too low ({state.best_support:.2f})"
+            cv2.putText(out, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 0, 255), 2, cv2.LINE_AA)
+            return out
+        (cx, cy), (A, B), ang = state.best_ell
+        cx_f, cy_f = cx + x0, cy + y0
+        cv2.ellipse(out, ((cx_f, cy_f), (A, B), ang), (0, 0, 255), 2)
+        cv2.circle(out, (int(cx_f), int(cy_f)), 3, (0, 0, 255), -1)
+
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Pipeline runner                                                     #
+    # ------------------------------------------------------------------ #
+
+    _PIPELINE = [
+        (1, '_compute1', '_viz1'),
+        (2, '_compute2', '_viz2'),
+        (3, '_compute3', '_viz3'),
+        (4, '_compute4', '_viz4'),
+        (5, '_compute5', '_viz5'),
+        (6, '_compute6', '_viz6'),
+        (7, '_compute7', '_viz7'),
+        (8, '_compute8', '_viz8'),
+    ]
+
+    def process(self, frame: np.ndarray, ctx: FrameContext) -> np.ndarray:
+        state = PipelineState(frame_bgr=frame)
+
+        if self.cfg.step == 0:
+            vizs = {}
+            for step_num, compute_name, viz_name in self._PIPELINE:
+                state = getattr(self, compute_name)(state, ctx)
+                vizs[step_num] = getattr(self, viz_name)(state)
+            return self._make_mosaic(frame, vizs)
+
+        for step_num, compute_name, viz_name in self._PIPELINE:
+            state = getattr(self, compute_name)(state, ctx)
+            if step_num == self.cfg.step:
+                return getattr(self, viz_name)(state)
+
+        return frame
+
+    def _make_mosaic(self, frame: np.ndarray, vizs: dict) -> np.ndarray:
+        panels = []
+        for i in range(1, 9):
+            panel = vizs.get(i, frame.copy())
+            cv2.putText(panel, f"S{i}", (3, 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+            panels.append(panel)
+        row1 = np.concatenate(panels[:4], axis=1)
+        row2 = np.concatenate(panels[4:], axis=1)
+        return np.concatenate([row1, row2], axis=0)
+
     def _heatmap_roi(self, gray: np.ndarray, ctx: FrameContext) -> Tuple[int, int, int, int]:
-        """Run HeatmapNet on the full eye frame and return an N×N ROI centered on the prediction."""
         from utils.heatmap_infer import infer_pupil_from_heatmapnet
         pred = infer_pupil_from_heatmapnet(
             self._heatmap_model, gray,
@@ -409,437 +720,6 @@ class PupilDetector:
         x1 = min(w, cx + hs)
         y1 = min(h, cy + hs)
         return (x0, y0, x1, y1)
-
-    def preprocess(self, frame: np.ndarray, ctx: FrameContext) -> PreprocessResult:
-        if self._heatmap_model is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            ctx.roi_rect = self._heatmap_roi(gray, ctx)
-
-        return PreprocessResult(masked_frame=frame)
-
-    def render(self, frame: np.ndarray, prep: PreprocessResult, ctx: FrameContext) -> np.ndarray:
-        step_fn = self.steps.get(self.cfg.step, self.steps[-1])
-        return step_fn(frame, prep, ctx)
-
-    def _build_steps(self):
-        return {
-            0: self._step_all,
-            1: self._step1_roi_guess,
-            2: self._step2_canny,
-            3: self._step3_dark_mask_overlay,
-            4: self._step4_edges_in_dark,
-            5: self._step5_edges_dark_not_spec,
-            6: self._step6_segments,
-            7: self._step7_ellipse_candidates,
-            8: self._step8_best_ellipse_by_support,
-            -1: self._step_not_implemented,
-        }
-
-    # ----- Steps -----
-
-    def _step1_roi_guess(self, frame, prep, ctx):
-        gray_m = cv2.cvtColor(prep.masked_frame, cv2.COLOR_BGR2GRAY)
-        guess = initial_guess_darkest_patch(gray_m, ctx.roi_rect)
-        return draw_step1_debug(prep.masked_frame, ctx.roi_rect, guess)
-
-    def _step2_canny(self, frame, prep, ctx):
-        return draw_step2_canny(prep.masked_frame, ctx.roi_rect)
-
-    def _step3_dark_mask_overlay(self, frame, prep, ctx):
-        gray_m = cv2.cvtColor(prep.masked_frame, cv2.COLOR_BGR2GRAY)
-        x0, y0, x1, y1 = ctx.roi_rect
-        roi = gray_m[y0:y1, x0:x1]
-
-        dark_mask, peak, thr = compute_dark_region_mask(roi, offset=18)
-
-        out = prep.masked_frame.copy()
-        mask_col = np.zeros_like(out)
-        mask_col[y0:y1, x0:x1, 0] = dark_mask
-        out = cv2.addWeighted(out, 1.0, mask_col, 0.6, 0)
-
-        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
-        cv2.putText(out, f"dark peak={peak}, thr={thr}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        return out
-
-    def _step4_edges_in_dark(self, frame, prep, ctx):
-        gray_m = cv2.cvtColor(prep.masked_frame, cv2.COLOR_BGR2GRAY)
-        x0, y0, x1, y1 = ctx.roi_rect
-        roi = gray_m[y0:y1, x0:x1]
-
-        roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
-        edges = cv2.Canny(roi_blur, 30, 90)
-
-        dark_mask, peak, thr = compute_dark_region_mask(roi, offset=14)
-        edges_dark = cv2.bitwise_and(edges, dark_mask)
-
-        out = prep.masked_frame.copy()
-        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
-        ys, xs = np.where(edges_dark > 0)
-        out[y0 + ys, x0 + xs] = (0, 255, 0)
-
-        cv2.putText(out, f"edges ∩ dark (peak={peak}, thr={thr})",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        return out
-
-    def _step5_edges_dark_not_spec(self, frame, prep, ctx):
-        gray_m = cv2.cvtColor(prep.masked_frame, cv2.COLOR_BGR2GRAY)
-        x0, y0, x1, y1 = ctx.roi_rect
-        roi = gray_m[y0:y1, x0:x1]
-
-        roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
-        edges = cv2.Canny(roi_blur, 30, 90)
-
-        dark_mask, peak, thr = compute_dark_region_mask(roi, offset=18)
-        spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
-        eyelash_mask = compute_eyelash_mask(
-            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
-            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
-
-        edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
-        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
-
-        if self.cfg.morph_close_size > 0:
-            k = 2 * self.cfg.morph_close_size + 1
-            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
-                                           np.ones((k, k), np.uint8))
-
-        out = prep.masked_frame.copy()
-        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
-
-        ys, xs = np.where(edges_final > 0)
-        out[y0 + ys, x0 + xs] = (0, 255, 0)
-
-        red = np.zeros_like(out)
-        red[y0:y1, x0:x1, 2] = spec_mask
-        out = cv2.addWeighted(out, 1.0, red, 0.35, 0)
-
-        # Cyan overlay: eyelash-masked region
-        cyan = np.zeros_like(out)
-        cyan[y0:y1, x0:x1, 0] = eyelash_mask
-        cyan[y0:y1, x0:x1, 1] = eyelash_mask
-        out = cv2.addWeighted(out, 1.0, cyan, 0.25, 0)
-
-        cv2.putText(out, f"edges ∩ dark ∩ !spec ∩ !lash (peak={peak}, thr={thr}, spec={self.cfg.spec_thr})",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        return out
-
-    def _step6_segments(self, frame, prep, ctx):
-        gray_m = cv2.cvtColor(prep.masked_frame, cv2.COLOR_BGR2GRAY)
-        x0, y0, x1, y1 = ctx.roi_rect
-        roi = gray_m[y0:y1, x0:x1]
-
-        roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
-        edges = cv2.Canny(roi_blur, 30, 90)
-
-        dark_mask, peak, thr = compute_dark_region_mask(roi, offset=18)
-        spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
-        eyelash_mask = compute_eyelash_mask(
-            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
-            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
-
-        edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
-        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
-
-        if self.cfg.morph_close_size > 0:
-            k = 2 * self.cfg.morph_close_size + 1
-            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
-                                           np.ones((k, k), np.uint8))
-
-        contours, _ = cv2.findContours(edges_final, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-
-        out = prep.masked_frame.copy()
-        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
-
-        palette = [
-            (0, 255, 0), (0, 200, 255), (255, 200, 0),
-            (255, 0, 255), (255, 255, 0), (0, 255, 255),
-            (200, 200, 255),
-        ]
-
-        seg_count = 0
-        for cnt in contours:
-            if cnt is None or len(cnt) < 5:
-                continue
-            pts = cnt.reshape(-1, 2).astype(np.float32)
-            segments = split_contour_by_curvature(
-                pts,
-                min_len=self.cfg.split_min_len,
-                max_jump=self.cfg.split_max_jump,
-                max_corner_deg=self.cfg.split_corner_deg
-            )
-            for seg in segments:
-                chord = float(np.linalg.norm(seg[-1] - seg[0]))
-                arc = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) + 1e-9
-                if chord / arc > self.cfg.max_seg_straightness:
-                    continue  # reject eyelash-like straight segments
-                c = palette[seg_count % len(palette)]
-                seg_shift = seg.copy()
-                seg_shift[:, 0] += x0
-                seg_shift[:, 1] += y0
-                draw_polyline(out, seg_shift, c, thickness=2)
-                seg_count += 1
-
-        cv2.putText(out, f"segments={seg_count} (peak={peak} thr={thr} spec={self.cfg.spec_thr})",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        return out
-
-    def _step7_ellipse_candidates(self, frame, prep, ctx):
-        gray_m = cv2.cvtColor(prep.masked_frame, cv2.COLOR_BGR2GRAY)
-        x0, y0, x1, y1 = ctx.roi_rect
-        roi = gray_m[y0:y1, x0:x1]
-
-        roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
-        edges = cv2.Canny(roi_blur, 30, 90)
-
-        dark_mask, _, _ = compute_dark_region_mask(roi, offset=18)
-        spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
-        eyelash_mask = compute_eyelash_mask(
-            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
-            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
-
-        edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
-        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
-
-        if self.cfg.morph_close_size > 0:
-            k = 2 * self.cfg.morph_close_size + 1
-            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
-                                           np.ones((k, k), np.uint8))
-
-        contours, _ = cv2.findContours(edges_final, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-
-        candidates = []
-        roi_h, roi_w = roi.shape
-        roi_cx, roi_cy = roi_w / 2.0, roi_h / 2.0
-        roi_rad = 0.5 * min(roi_w, roi_h)
-
-        for cnt in contours:
-            if cnt is None or len(cnt) < 5:
-                continue
-            pts = cnt.reshape(-1, 2).astype(np.float32)
-            segments = split_contour_by_curvature(
-                pts,
-                min_len=self.cfg.split_min_len,
-                max_jump=self.cfg.split_max_jump,
-                max_corner_deg=self.cfg.split_corner_deg
-            )
-            for seg in segments:
-                if len(seg) < 5:
-                    continue
-                chord = float(np.linalg.norm(seg[-1] - seg[0]))
-                arc = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) + 1e-9
-                if chord / arc > self.cfg.max_seg_straightness:
-                    continue  # reject eyelash-like straight segments
-                seg_cv = seg.reshape(-1, 1, 2).astype(np.float32)
-                try:
-                    ell = cv2.fitEllipse(seg_cv)
-                except cv2.error:
-                    continue
-
-                area = ellipse_area(ell)
-                if area < self.cfg.min_ellipse_area:
-                    continue
-
-                asp = ellipse_aspect_ratio(ell)
-                if asp > self.cfg.max_aspect:
-                    continue
-
-                (ecx, ecy), (A, B), ang = ell
-                dist = np.sqrt((ecx - roi_cx) ** 2 + (ecy - roi_cy) ** 2) / (roi_rad + 1e-9)
-                if dist > self.cfg.max_center_dist:
-                    continue
-
-                candidates.append((area, dist, asp, ell))
-
-        candidates.sort(key=lambda t: t[0], reverse=True)
-
-        out = prep.masked_frame.copy()
-        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
-
-        ys, xs = np.where(edges_final > 0)
-        out[y0 + ys, x0 + xs] = (0, 255, 0)
-
-        to_draw = candidates if self.cfg.draw_all_ellipses else candidates[:self.cfg.topN]
-        for (area, dist, asp, ell) in to_draw:
-            (ecx, ecy), (A, B), ang = ell
-            ell_full = ((ecx + x0, ecy + y0), (A, B), ang)
-            cv2.ellipse(out, ell_full, (255, 0, 0), 2)
-
-        cv2.putText(out, f"ellipses={len(candidates)} drawn={len(to_draw)}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        return out
-
-    def _step8_best_ellipse_by_support(self, frame, prep, ctx):
-        ctx.pupil_cx = ctx.pupil_cy = ctx.pupil_diameter = ctx.pupil_confidence = float("nan")
-
-        gray_m = cv2.cvtColor(prep.masked_frame, cv2.COLOR_BGR2GRAY)
-        x0, y0, x1, y1 = ctx.roi_rect
-        roi = gray_m[y0:y1, x0:x1]
-
-        roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
-        edges = cv2.Canny(roi_blur, 30, 90)
-
-        dark_mask, peak, thr = compute_dark_region_mask(roi, offset=18)
-        spec_mask = compute_specular_mask(roi, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
-        eyelash_mask = compute_eyelash_mask(
-            roi, self.cfg.eyelash_dark_thr, self.cfg.eyelash_kernel_len,
-            self.cfg.eyelash_n_angles, self.cfg.eyelash_dilate)
-
-        edges_dark = cv2.bitwise_and(edges, dark_mask)
-        edges_no_spec = cv2.bitwise_and(edges_dark, cv2.bitwise_not(spec_mask))
-        edges_final = cv2.bitwise_and(edges_no_spec, cv2.bitwise_not(eyelash_mask))
-
-        if self.cfg.morph_close_size > 0:
-            k = 2 * self.cfg.morph_close_size + 1
-            edges_final = cv2.morphologyEx(edges_final, cv2.MORPH_CLOSE,
-                                           np.ones((k, k), np.uint8))
-
-        ys, xs = np.where(edges_final > 0)
-        edge_pts = np.stack([xs, ys], axis=1).astype(np.float32) if len(xs) else np.zeros((0, 2), np.float32)
-
-        contours, _ = cv2.findContours(edges_final, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-
-        roi_h, roi_w = roi.shape
-        roi_cx, roi_cy = roi_w / 2.0, roi_h / 2.0
-        roi_rad = 0.5 * min(roi_w, roi_h)
-
-        # Heatmap prior: convert full-frame coords to ROI-local coords
-        hm_roi_cx = ctx.heatmap_cx - x0 if not np.isnan(ctx.heatmap_cx) else None
-        hm_roi_cy = ctx.heatmap_cy - y0 if not np.isnan(ctx.heatmap_cy) else None
-
-        candidates = []
-        for cnt in contours:
-            if cnt is None or len(cnt) < 5:
-                continue
-            pts = cnt.reshape(-1, 2).astype(np.float32)
-            segments = split_contour_by_curvature(
-                pts,
-                min_len=self.cfg.split_min_len,
-                max_jump=self.cfg.split_max_jump,
-                max_corner_deg=self.cfg.split_corner_deg
-            )
-
-            for seg in segments:
-                if len(seg) < 5:
-                    continue
-                chord = float(np.linalg.norm(seg[-1] - seg[0]))
-                arc = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) + 1e-9
-                if chord / arc > self.cfg.max_seg_straightness:
-                    continue  # reject eyelash-like straight segments
-
-                if self.cfg.ransac_n_iter > 0:
-                    ell = fit_ellipse_ransac(seg, self.cfg.ransac_n_iter, self.cfg.support_dist_px)
-                    if ell is None:
-                        continue
-                else:
-                    seg_cv = seg.reshape(-1, 1, 2).astype(np.float32)
-                    try:
-                        ell = cv2.fitEllipse(seg_cv)
-                    except cv2.error:
-                        continue
-
-                area = ellipse_area(ell)
-                if area < self.cfg.min_ellipse_area:
-                    continue
-
-                asp = ellipse_aspect_ratio(ell)
-                if asp > self.cfg.max_aspect:
-                    continue
-
-                (ecx, ecy), (A, B), ang = ell
-                dist = np.sqrt((ecx - roi_cx) ** 2 + (ecy - roi_cy) ** 2) / (roi_rad + 1e-9)
-                if dist > self.cfg.max_center_dist:
-                    continue
-
-                support_frac, support_score = ellipse_support_score(ell, edge_pts, dist_px=self.cfg.support_dist_px)
-
-                heatmap_penalty = 0.0
-                if hm_roi_cx is not None:
-                    hm_dist = np.sqrt((ecx - hm_roi_cx)**2 + (ecy - hm_roi_cy)**2) / (roi_rad + 1e-9)
-                    heatmap_penalty = self.cfg.heatmap_prior_weight * hm_dist
-
-                final_score = support_score - 0.25 * dist - 0.05 * max(0.0, asp - 1.0) - heatmap_penalty
-                candidates.append((final_score, support_frac, dist, asp, ell))
-
-        out = prep.masked_frame.copy()
-        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
-        out[y0 + ys, x0 + xs] = (0, 255, 0)
-
-        if not candidates:
-            cv2.putText(out, "no ellipse candidates",
-                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 0, 255), 2, cv2.LINE_AA)
-            return out
-
-        candidates.sort(key=lambda t: t[0], reverse=True)
-        best_score, best_support, best_dist, best_asp, best_ell = candidates[0]
-
-        if best_support < self.cfg.support_min_frac:
-            cv2.putText(out, f"best support too low ({best_support:.2f})",
-                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 0, 255), 2, cv2.LINE_AA)
-            return out
-
-        (cx, cy), (A, B), ang = best_ell
-        cx_full = cx + x0
-        cy_full = cy + y0
-
-        ctx.pupil_cx = cx_full
-        ctx.pupil_cy = cy_full
-        ctx.pupil_diameter = (A + B) / 2.0
-        ctx.pupil_confidence = best_support
-
-        cv2.ellipse(out, ((cx_full, cy_full), (A, B), ang), (0, 0, 255), 2)
-        cv2.circle(out, (int(cx_full), int(cy_full)), 3, (0, 0, 255), -1)
-
-        cv2.putText(out, f"score={best_score:.3f} supp={best_support:.2f} dist={best_dist:.2f} asp={best_asp:.2f}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        return out
-
-    def _step_all(self, frame, prep, ctx):
-        """Render all 8 pipeline steps as a 4×2 mosaic (same output size as a single step)."""
-        ordered = [
-            (1, self._step1_roi_guess),
-            (2, self._step2_canny),
-            (3, self._step3_dark_mask_overlay),
-            (4, self._step4_edges_in_dark),
-            (5, self._step5_edges_dark_not_spec),
-            (6, self._step6_segments),
-            (7, self._step7_ellipse_candidates),
-            (8, self._step8_best_ellipse_by_support),
-        ]
-
-        h, w = frame.shape[:2]
-        panel_w = w // 4
-        panel_h = h // 2
-
-        panels = []
-        for step_num, fn in ordered:
-            panel = fn(frame, prep, ctx)
-            panel = cv2.resize(panel, (panel_w, panel_h))
-            cv2.putText(panel, f"S{step_num}", (3, 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-            panels.append(panel)
-
-        row1 = np.concatenate(panels[:4], axis=1)
-        row2 = np.concatenate(panels[4:], axis=1)
-        return np.concatenate([row1, row2], axis=0)  # full-res: 4*w × 2*h
-
-    def _step_not_implemented(self, frame, prep, ctx):
-        out = prep.masked_frame.copy()
-        cv2.putText(out, f"Step {self.cfg.step} not implemented",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                    (0, 0, 255), 2, cv2.LINE_AA)
-        return out
 
 
 # =========================
@@ -920,10 +800,8 @@ def run_video(cfg: DetectorConfig):
             ctx_l.frame_idx = frame_idx
             ctx_r.frame_idx = frame_idx
 
-            prep_l = detector.preprocess(left,  ctx_l)
-            prep_r = detector.preprocess(right, ctx_r)
-            out_l  = detector.render(left,  prep_l, ctx_l)
-            out_r  = detector.render(right, prep_r, ctx_r)
+            out_l = detector.process(left,  ctx_l)
+            out_r = detector.process(right, ctx_r)
 
             if cfg.step == 0:
                 # mosaic frames are 4*mid × 2*h — downscale to writer dims before saving
@@ -991,6 +869,11 @@ def build_arg_parser():
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--out", type=str, default="")
 
+    ap.add_argument("--canny_low", type=int, default=50,
+                    help="Canny lower threshold (hysteresis)")
+    ap.add_argument("--canny_high", type=int, default=100,
+                    help="Canny upper threshold (hysteresis)")
+
     ap.add_argument("--spec_thr", type=int, default=220)
     ap.add_argument("--spec_dilate", type=int, default=3)
 
@@ -1013,7 +896,7 @@ def build_arg_parser():
 
     ap.add_argument("--heatmap_ckpt", type=str, default="",
                     help="HeatmapNet checkpoint (.pth). If set, uses heatmap to place ROI each frame.")
-    ap.add_argument("--heatmap_roi_size", type=int, default=140,
+    ap.add_argument("--heatmap_roi_size", type=int, default=30,
                     help="Side length (px) of the square ROI centered on heatmap prediction")
     ap.add_argument("--heatmap_device", type=str, default="cuda" if _cuda_available() else "cpu")
     ap.add_argument("--heatmap_kp_index", type=int, default=1,
@@ -1052,6 +935,9 @@ def cfg_from_args(args) -> DetectorConfig:
         roi=args.roi,
         preview=args.preview,
         out=args.out,
+
+        canny_low=args.canny_low,
+        canny_high=args.canny_high,
 
         spec_thr=args.spec_thr,
         spec_dilate=args.spec_dilate,
