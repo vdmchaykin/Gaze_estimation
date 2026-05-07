@@ -150,6 +150,42 @@ def compute_specular_mask(roi_gray, thr=220, dilate=3):
     return spec
 
 
+def bridge_edge_gaps(edges, max_gap=8, max_angle_deg=45.0):
+    """Connect nearby arc endpoints separated by small gaps.
+
+    For each pair of contour endpoints within max_gap pixels, draws a bridging
+    line if both tangents point roughly toward the gap (direction check).
+    """
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
+    endpoints = []  # (point, outward_tangent, contour_idx)
+    for i, cnt in enumerate(contours):
+        pts = cnt.reshape(-1, 2).astype(float)
+        if len(pts) < 3:
+            continue
+        k = min(3, len(pts) - 1)
+        endpoints.append((pts[0],    pts[0] - pts[k],    i))
+        endpoints.append((pts[-1],   pts[-1] - pts[-(k + 1)], i))
+
+    result = edges.copy()
+    n = len(endpoints)
+    for i in range(n):
+        pi, ti, ci = endpoints[i]
+        for j in range(i + 1, n):
+            pj, tj, cj = endpoints[j]
+            if ci == cj:
+                continue
+            dist = float(np.linalg.norm(pi - pj))
+            if dist < 1.0 or dist > max_gap:
+                continue
+            bridge = (pj - pi) / dist
+            if _angle_deg(ti, bridge) > max_angle_deg or _angle_deg(tj, -bridge) > max_angle_deg:
+                continue
+            cv2.line(result, tuple(pi.astype(int)), tuple(pj.astype(int)), 255, 1)
+
+    return result
+
+
 def compute_eyelash_mask(roi_gray, dark_thr=70, kernel_len=13, n_angles=6, dilate=2):
     """Detect thin elongated dark structures (eyelashes) via morphological line opening."""
     dark = (roi_gray < dark_thr).astype(np.uint8) * 255
@@ -338,8 +374,12 @@ class DetectorConfig:
     eyelash_n_angles: int = 6     # number of line orientations (0..180°)
     eyelash_dilate: int = 2       # dilation radius for eyelash mask (px)
 
+    # Edge gap closing — endpoint bridging
+    gap_bridge_max_dist: int = 0        # max pixel gap to bridge; 0 = disabled
+    gap_bridge_angle_deg: float = 45.0  # max angle between endpoint tangent and bridge direction
+
     # Edge gap closing (bridges pupil arc breaks caused by eyelashes)
-    morph_close_size: int = 2     # closing kernel radius; 0 = disabled (kernel = 2r+1)
+    morph_close_size: int = 0     # closing kernel radius; 0 = disabled (kernel = 2r+1)
 
     # RANSAC ellipse fitting
     ransac_n_iter: int = 100      # 0 = use direct fitEllipse (original behaviour)
@@ -383,6 +423,7 @@ class PipelineState:
     edges_dark: Optional[np.ndarray] = None
     spec_mask: Optional[np.ndarray] = None
     edges_filtered: Optional[np.ndarray] = None
+    bridge_mask: Optional[np.ndarray] = None
     segments: List[np.ndarray] = field(default_factory=list)
     candidates: List = field(default_factory=list)  # (area, dist, asp, ell, seg)
     best_ell: Any = None
@@ -428,7 +469,7 @@ class PupilDetector:
 
     def _compute3(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
         state.dark_mask, state.dark_peak, state.dark_thr = compute_dark_region_mask(
-            state.roi_gray, offset=18)
+            state.roi_gray, offset=10)
         return state
 
     def _compute4(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
@@ -439,12 +480,16 @@ class PupilDetector:
     def _compute5(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
         state.spec_mask = compute_specular_mask(
             state.roi_gray, thr=self.cfg.spec_thr, dilate=self.cfg.spec_dilate)
-        edges_filtered = cv2.bitwise_and(state.edges_dark, cv2.bitwise_not(state.spec_mask))
-        if self.cfg.morph_close_size > 0:
-            k = 2 * self.cfg.morph_close_size + 1
-            edges_filtered = cv2.morphologyEx(edges_filtered, cv2.MORPH_CLOSE,
-                                              np.ones((k, k), np.uint8))
-        state.edges_filtered = edges_filtered
+        edges = cv2.bitwise_and(state.edges_dark, cv2.bitwise_not(state.spec_mask))
+        if self.cfg.gap_bridge_max_dist > 0:
+            bridged = bridge_edge_gaps(
+                edges,
+                max_gap=self.cfg.gap_bridge_max_dist,
+                max_angle_deg=self.cfg.gap_bridge_angle_deg,
+            )
+            state.bridge_mask = cv2.bitwise_and(bridged, cv2.bitwise_not(edges))
+            edges = bridged
+        state.edges_filtered = edges
         return state
 
     def _compute6(self, state: PipelineState, ctx: FrameContext) -> PipelineState:
@@ -606,10 +651,12 @@ class PupilDetector:
         cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
         ys, xs = np.where(state.edges_filtered > 0)
         out[y0 + ys, x0 + xs] = (0, 255, 0)
+        if state.bridge_mask is not None:
+            bys, bxs = np.where(state.bridge_mask > 0)
+            out[y0 + bys, x0 + bxs] = (255, 0, 0)
         red = np.zeros_like(out)
         red[y0:y1, x0:x1, 2] = state.spec_mask
         out = cv2.addWeighted(out, 1.0, red, 0.35, 0)
-
         return out
 
     def _viz6(self, state: PipelineState) -> np.ndarray:
@@ -877,8 +924,8 @@ def build_arg_parser():
     ap.add_argument("--spec_thr", type=int, default=220)
     ap.add_argument("--spec_dilate", type=int, default=3)
 
-    ap.add_argument("--split_min_len", type=int, default=18)
-    ap.add_argument("--split_max_jump", type=float, default=6.0)
+    ap.add_argument("--split_min_len", type=int, default=20)
+    ap.add_argument("--split_max_jump", type=float, default=10.0)
     ap.add_argument("--split_corner_deg", type=float, default=75.0)
 
     ap.add_argument("--min_ellipse_area", type=float, default=250.0)
@@ -913,9 +960,13 @@ def build_arg_parser():
     ap.add_argument("--eyelash_dilate", type=int, default=2,
                     help="Dilation radius (px) applied to eyelash mask after detection")
 
-    ap.add_argument("--morph_close_size", type=int, default=2,
+    ap.add_argument("--gap_bridge_max_dist", type=int, default=0,
+                    help="Max pixel gap between arc endpoints to bridge; 0 = disabled")
+    ap.add_argument("--gap_bridge_angle_deg", type=float, default=45.0,
+                    help="Max tangent-to-bridge angle for endpoint bridging")
+    ap.add_argument("--morph_close_size", type=int, default=0,
                     help="Closing kernel radius for bridging pupil arc gaps; 0=disabled")
-    ap.add_argument("--ransac_n_iter", type=int, default=100,
+    ap.add_argument("--ransac_n_iter", type=int, default=0,
                     help="RANSAC iterations for ellipse fitting; 0=use direct fitEllipse")
     ap.add_argument("--max_seg_straightness", type=float, default=0.92,
                     help="Segment chord/arc ratio above which it is rejected as eyelash (1.0=straight line)")
@@ -969,6 +1020,8 @@ def cfg_from_args(args) -> DetectorConfig:
         eyelash_n_angles=args.eyelash_n_angles,
         eyelash_dilate=args.eyelash_dilate,
 
+        gap_bridge_max_dist=args.gap_bridge_max_dist,
+        gap_bridge_angle_deg=args.gap_bridge_angle_deg,
         morph_close_size=args.morph_close_size,
         ransac_n_iter=args.ransac_n_iter,
         max_seg_straightness=args.max_seg_straightness,
