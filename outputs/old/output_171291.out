@@ -1,8 +1,0 @@
->>> pretrain_unityeyes.py started
->>> Project root added to sys.path: /home/s44vchai/Computer_Animation/Project
-/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/io/image.py:13: UserWarning: Failed to load image Python extension: '/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/image.so: undefined symbol: _ZN3c1017RegisterOperatorsD1Ev'If you don't plan on using image functionality from `torchvision.io`, you can ignore this warning. Otherwise, there might be something wrong with your environment. Did you have `libjpeg` or `libpng` installed before building `torchvision` from source?
-  warn(
-Traceback (most recent call last):
-  File "/home/s44vchai/Computer_Animation/Project/train/pretrain_unityeyes.py", line 17, in <module>
-    from datasets.unityeyes_dataset import UnityEyesDataset
-ModuleNotFoundError: No module named 'datasets.unityeyes_dataset'

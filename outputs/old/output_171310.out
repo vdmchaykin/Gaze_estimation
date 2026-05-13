@@ -1,8 +1,0 @@
-/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/io/image.py:13: UserWarning: Failed to load image Python extension: '/home/s44vchai/.conda/envs/gaze_env/lib/python3.10/site-packages/torchvision/image.so: undefined symbol: _ZN3c1017RegisterOperatorsD1Ev'If you don't plan on using image functionality from `torchvision.io`, you can ignore this warning. Otherwise, there might be something wrong with your environment. Did you have `libjpeg` or `libpng` installed before building `torchvision` from source?
-  warn(
-Traceback (most recent call last):
-  File "/home/s44vchai/Computer_Animation/Project/train/finetune_openeds.py", line 41, in <module>
-    dataset = OpenEDSDataset(
-  File "/home/s44vchai/Computer_Animation/Project/datasets/openeds_dataset.py", line 42, in __init__
-    for f in os.listdir(img_dir)
-FileNotFoundError: [Errno 2] No such file or directory: 'data/OpenEDS/openEDS/S_0'
