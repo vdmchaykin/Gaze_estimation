@@ -208,6 +208,16 @@ def convert_extimu(raw_path: str, out_path: str):
     print(f"  extimu: {len(rows)} rows -> {out_path}")
 
 
+def convert_timestamps(time_path: str, out_path: str):
+    timestamps = read_timestamps(time_path)
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp_ns"])
+        for ts in timestamps:
+            writer.writerow([ts])
+    print(f"  timestamps: {len(timestamps)} rows -> {out_path}")
+
+
 def convert_worn(raw_path: str, time_path: str, out_path: str):
     data = read_raw(raw_path, np.dtype("u1"))
     timestamps = read_timestamps(time_path)
@@ -291,6 +301,11 @@ def convert_recording(directory: str):
         os.path.join(out_dir, "extimu.csv"))
 
     # worn has no .time file — uses gaze timestamps (same frame rate)
+    try_convert("timestamps",
+        convert_timestamps,
+        path("gaze ps1.time"),
+        os.path.join(out_dir, "timestamps.csv"))
+
     try_convert("worn",
         convert_worn,
         path("worn ps1.raw"), path("gaze ps1.time"),

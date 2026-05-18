@@ -211,27 +211,6 @@ def compute_eyelash_mask(roi_gray, dark_thr=70, kernel_len=13, n_angles=6, dilat
     return eyelash
 
 
-def fit_ellipse_ransac(points, n_iter=100, inlier_dist=2.5):
-    """Fit ellipse using RANSAC — robust to eyelash edge outliers."""
-    pts = points.reshape(-1, 2).astype(np.float32)
-    n = len(pts)
-    if n < 5:
-        return None
-    best_ell, best_inliers = None, 0
-    for _ in range(n_iter):
-        idx = np.random.choice(n, 5, replace=False)
-        sample = pts[idx].reshape(-1, 1, 2)
-        try:
-            ell = cv2.fitEllipse(sample)
-        except cv2.error:
-            continue
-        frac, _ = ellipse_support_score(ell, pts, dist_px=inlier_dist)
-        n_inliers = int(frac * n)
-        if n_inliers > best_inliers:
-            best_inliers = n_inliers
-            best_ell = ell
-    return best_ell
-
 
 def _angle_deg(v1, v2):
     n1 = np.linalg.norm(v1) + 1e-9
@@ -371,9 +350,6 @@ class DetectorConfig:
     # Edge gap closing — endpoint bridging
     gap_bridge_max_dist: int = 0        # max pixel gap to bridge; 0 = disabled
     gap_bridge_angle_deg: float = 45.0  # max angle between endpoint tangent and bridge direction
-
-    # RANSAC ellipse fitting
-    ransac_n_iter: int = 100      # 0 = use direct fitEllipse (original behaviour)
 
     # Segment linearity filter (eyelash rejection)
     # chord/arc_length ratio: 1.0 = perfectly straight, ~0.5 = strong curve
@@ -546,23 +522,8 @@ class PupilDetector:
         hm_roi_cy = ctx.heatmap_cy - y0 if not np.isnan(ctx.heatmap_cy) else None
 
         scored = []
-        for (area, dist, asp, ell_init, seg) in state.candidates:
-            if self.cfg.ransac_n_iter > 0:
-                ell = fit_ellipse_ransac(seg, self.cfg.ransac_n_iter, self.cfg.support_dist_px)
-                if ell is None:
-                    continue
-                if ellipse_area(ell) < self.cfg.min_ellipse_area:
-                    continue
-                asp = ellipse_aspect_ratio(ell)
-                if asp > self.cfg.max_aspect:
-                    continue
-                (ecx, ecy), _, _ = ell
-                dist = np.sqrt((ecx - roi_cx) ** 2 + (ecy - roi_cy) ** 2) / (roi_rad + 1e-9)
-                if dist > self.cfg.max_center_dist:
-                    continue
-            else:
-                ell = ell_init
-                (ecx, ecy), _, _ = ell
+        for (area, dist, asp, ell, seg) in state.candidates:
+            (ecx, ecy), _, _ = ell
 
             support_frac, support_score = ellipse_support_score(
                 ell, edge_pts, dist_px=self.cfg.support_dist_px)
@@ -781,7 +742,9 @@ def _load_timestamps(states_path: str) -> list:
     if not states_path:
         return []
     with open(states_path, newline="") as f:
-        return [int(row["timestamp [ns]"]) for row in csv.DictReader(f)]
+        reader = csv.DictReader(f)
+        col = "timestamp [ns]" if "timestamp [ns]" in (reader.fieldnames or []) else "timestamp_ns"
+        return [int(row[col]) for row in reader]
 
 
 def run_video(cfg: DetectorConfig):
@@ -803,12 +766,14 @@ def run_video(cfg: DetectorConfig):
     timestamps = _load_timestamps(cfg.states)
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if timestamps and len(timestamps) != nframes:
-        raise RuntimeError(
-            f"Timestamp count ({len(timestamps)}) != video frame count ({nframes}). "
-            f"Check --states matches the recording."
+        print(
+            f"[warn] Timestamp count ({len(timestamps)}) != video frame count ({nframes}). "
+            f"Truncating to {min(len(timestamps), nframes)} entries."
         )
+        timestamps = timestamps[:nframes]
 
-    output_path = cfg.out.strip() if cfg.out.strip() else f"debug_step_{cfg.step}.avi"
+    out_raw = cfg.out.strip() if cfg.out.strip() else f"debug_step_{cfg.step}"
+    output_path = out_raw if os.path.splitext(out_raw)[1] else out_raw + ".avi"
     # Output width = left_half + right_half (handles odd w by trimming right)
     out_w = mid + mid
     writer, used_codec, used_fps = make_writer(output_path, fps, (out_w, h))
@@ -826,15 +791,20 @@ def run_video(cfg: DetectorConfig):
     ctx_r = FrameContext(frame_idx=0, roi_rect=roi_r)
 
     csv_path = os.path.splitext(output_path)[0] + "_pupils.csv"
+    heatmap_csv_path = os.path.splitext(output_path)[0] + "_heatmap.csv"
 
     frame_idx = 0
-    with open(csv_path, "w", newline="") as csv_file:
+    with open(csv_path, "w", newline="") as csv_file, \
+         open(heatmap_csv_path, "w", newline="") as heatmap_file:
         cw = csv.writer(csv_file)
         cw.writerow([
             "timestamp [ns]",
             "xL", "yL", "diameter_L", "confidence_L",
             "xR", "yR", "diameter_R", "confidence_R",
         ])
+
+        hw = csv.writer(heatmap_file)
+        hw.writerow(["timestamp [ns]", "heatmap_xL", "heatmap_yL", "heatmap_xR", "heatmap_yR"])
 
         while True:
             ret, frame = cap.read()
@@ -859,6 +829,8 @@ def run_video(cfg: DetectorConfig):
                 out = np.concatenate([out_l, out_r], axis=1)
             writer.write(out)
 
+            if timestamps and frame_idx >= len(timestamps):
+                break
             ts = timestamps[frame_idx] if timestamps else frame_idx
             lx, ly = _effective_xy(ctx_l)
             rx, ry = _effective_xy(ctx_r)
@@ -868,6 +840,12 @@ def run_video(cfg: DetectorConfig):
                 _fmt(ctx_l.pupil_diameter), _fmt(ctx_l.pupil_confidence),
                 rx, ry,
                 _fmt(ctx_r.pupil_diameter), _fmt(ctx_r.pupil_confidence),
+            ])
+
+            hw.writerow([
+                ts,
+                _fmt(ctx_l.heatmap_cx), _fmt(ctx_l.heatmap_cy),
+                _fmt(ctx_r.heatmap_cx), _fmt(ctx_r.heatmap_cy),
             ])
 
             if cfg.preview:
@@ -900,8 +878,9 @@ def run_video(cfg: DetectorConfig):
     if cfg.preview:
         cv2.destroyAllWindows()
 
-    print(f"Saved video : {output_path}")
-    print(f"Saved CSV   : {csv_path}")
+    print(f"Saved video      : {output_path}")
+    print(f"Saved CSV        : {csv_path}")
+    print(f"Saved heatmap CSV: {heatmap_csv_path}")
     print(f"Codec: {used_codec}, FPS: {used_fps:.2f}, Frames: {frame_idx}")
 
 
@@ -957,8 +936,6 @@ def build_arg_parser():
                     help="Max pixel gap between arc endpoints to bridge; 0 = disabled")
     ap.add_argument("--gap_bridge_angle_deg", type=float, default=45.0,
                     help="Max tangent-to-bridge angle for endpoint bridging")
-    ap.add_argument("--ransac_n_iter", type=int, default=0,
-                    help="RANSAC iterations for ellipse fitting; 0=use direct fitEllipse")
     ap.add_argument("--max_seg_straightness", type=float, default=0.92,
                     help="Segment chord/arc ratio above which it is rejected as eyelash (1.0=straight line)")
     ap.add_argument("--preview_eye", type=str, default="both",
@@ -1008,7 +985,6 @@ def cfg_from_args(args) -> DetectorConfig:
 
         gap_bridge_max_dist=args.gap_bridge_max_dist,
         gap_bridge_angle_deg=args.gap_bridge_angle_deg,
-        ransac_n_iter=args.ransac_n_iter,
         max_seg_straightness=args.max_seg_straightness,
         preview_eye=args.preview_eye,
         preview_scale=args.preview_scale,

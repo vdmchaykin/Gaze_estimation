@@ -13,6 +13,12 @@
 *.mpeg
 *.mpg
 
+*.csv
+
 # Virtual environment
 gaze_env/
 PhoneExport
+data/
+
+# Scratch notebooks
+experiments_2.ipynb

@@ -78,6 +78,16 @@ def _load_scene_timestamps(path: str) -> list:
     return ts
 
 
+def _generate_scene_timestamps(sensor_csv: str, n_frames: int) -> list:
+    df = pd.read_csv(sensor_csv)
+    col = next((c for c in df.columns if "timestamp" in c.lower()), None)
+    if col is None:
+        raise ValueError(f"No timestamp column found in {sensor_csv}")
+    ts = pd.to_numeric(df[col], errors="coerce").dropna().astype(np.int64)
+    t_start, t_end = int(ts.min()), int(ts.max())
+    return np.linspace(t_start, t_end, n_frames, dtype=np.int64).tolist()
+
+
 def _seek_eye(eye_cap, scene_frame_idx, eye_fps, scene_fps):
     """Seek eye video to the frame matching scene_frame_idx and return it."""
     if eye_cap is None:
@@ -161,10 +171,11 @@ def _embed_eye(scene_frame, eye_frame, frac=0.22, margin=12):
 # ---------------------------------------------------------------------------
 
 class CalibrationTool:
-    def __init__(self, scene_path, eye_path, ts_path, output_csv, scale):
+    def __init__(self, scene_path, eye_path, ts_path, sensor_csv, output_csv, scale):
         self.scene_path  = scene_path
         self.eye_path    = eye_path
         self.ts_path     = ts_path
+        self.sensor_csv  = sensor_csv
         self.output_csv  = output_csv
         self.scale       = scale
 
@@ -217,8 +228,10 @@ class CalibrationTool:
             if len(timestamps) < scene_total:
                 print(f"[warn] timestamp count {len(timestamps)} < frame count {scene_total} — last frames will use frame index as timestamp")
             elif len(timestamps) > scene_total:
-                # Neon exports extra leading timestamps; trim to video length
                 timestamps = timestamps[-scene_total:]
+        elif self.sensor_csv and os.path.exists(self.sensor_csv):
+            timestamps = _generate_scene_timestamps(self.sensor_csv, scene_total)
+            print(f"[OK] generated {len(timestamps)} scene timestamps from {os.path.basename(self.sensor_csv)}")
 
         win = "Calibration Tool"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -369,7 +382,7 @@ class CalibrationTool:
 
 def main():
     data_dir = os.path.join(os.path.dirname(__file__),
-                            "../data/2026-04-20_13-58-02-dffaeb67")
+                            "../data/Melissa")
 
     ap = argparse.ArgumentParser(
         description="Manual calibration: click 9 points on the scene video.")
@@ -380,8 +393,11 @@ def main():
                     default=os.path.join(data_dir, "Neon Sensor Module v1 ps1.mp4"),
                     help="Eye camera video path (optional, shown as overlay)")
     ap.add_argument("--timestamps",
-                    default=os.path.join(data_dir, "world_timestamps.csv"),
-                    help="Scene timestamp CSV (world_timestamps.csv)")
+                    default=None,
+                    help="Scene timestamp CSV (optional)")
+    ap.add_argument("--sensor-csv",
+                    default=os.path.join(data_dir, "csv", "timestamps.csv"),
+                    help="Sensor CSV used to derive scene timestamps (default: timestamps.csv)")
     ap.add_argument("--out",
                     default=os.path.join(data_dir, "calibration_points.csv"),
                     help="Output CSV for calibration points")
@@ -393,6 +409,7 @@ def main():
         scene_path=args.scene,
         eye_path=args.eye,
         ts_path=args.timestamps,
+        sensor_csv=args.sensor_csv,
         output_csv=args.out,
         scale=args.scale,
     )
